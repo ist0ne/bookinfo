@@ -48,7 +48,7 @@ spec:
       serviceAccountName: bookinfo-productpage
       containers:
       - name: productpage
-        image: hub.sensorsdata.cn/library/productpage:v1.0
+        image: hub.example.com/example/productpage:v1.0
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 9080
