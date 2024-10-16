@@ -1,0 +1,150 @@
+# 定义默认的容器镜像，build 阶段没有指定镜像，所以会使用此镜像
+image: hub.example.com/library/docker:24.0.5
+services:
+  # 在 docker 中启动 docker 用于编译镜像
+  - name: hub.example.com/library/docker:24.0.5-dind
+    alias: docker
+
+# 定义阶段（stage），配置文件中包含两个阶段--编译（build）和部署（deploy）阶段
+stages:
+  - build
+  - deploy
+
+# 定义变量，变量分为两种
+# 一种是自定义变量，可以在.gitlab-ci.yml和项目的设置界面上进行配置
+# 另一种是Gitlab内置变量，内置变量可参考：https://docs.gitlab.com/ee/ci/variables/
+variables:
+  IMAGE: $REPOSITORY/example/${CI_PROJECT_NAME}
+  
+  # When using dind service, you must instruct Docker to talk with
+  # the daemon started inside of the service. The daemon is available
+  # with a network connection instead of the default
+  # /var/run/docker.sock socket.
+  DOCKER_HOST: tcp://docker:2376
+  #
+  # The 'docker' hostname is the alias of the service container as described at
+  # https://docs.gitlab.com/ee/ci/services/#accessing-the-services.
+  # If you're using GitLab Runner 12.7 or earlier with the Kubernetes executor and Kubernetes 1.6 or earlier,
+  # the variable must be set to tcp://localhost:2376 because of how the
+  # Kubernetes executor connects services to the job container
+  # DOCKER_HOST: tcp://localhost:2376
+  #
+  # Specify to Docker where to create the certificates. Docker
+  # creates them automatically on boot, and creates
+  # `/certs/client` to share between the service and job
+  # container, thanks to volume mount from config.toml
+  DOCKER_TLS_CERTDIR: "/certs"
+  # These are usually specified by the entrypoint, however the
+  # Kubernetes executor doesn't run entrypoints
+  # https://gitlab.com/gitlab-org/gitlab-runner/-/issues/4125
+  DOCKER_TLS_VERIFY: 1
+  DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
+
+# 定义 build 任务
+docker build:
+  # 指定这个任务属于 build 阶段
+  stage: build
+  # 在script之前执行的命令
+  before_script:
+    - docker info
+    # 组合项目分支名 CI_COMMIT_REF_SLUG 和项目提交短ID CI_COMMIT_SHORT_SHA 变量
+    # 并赋值给 IMAGE_TAG 变量作为容器的标签，比如：master_44042448
+    - export IMAGE_TAG=${CI_COMMIT_REF_SLUG}_${CI_COMMIT_SHORT_SHA}
+  script:
+    - echo 'Building...'
+    # 登录镜像仓库，REPOSITORY_USER 和 REPOSITORY_PASSWORD 变量会在后面 Gitlab WEB 界面中进行设置
+    - docker login -u $REPOSITORY_USER -p $REPOSITORY_PASSWORD $REPOSITORY
+    # 编译容器镜像，Gitlab CI 会自动下载代码并跳转到代码根目录，在这个目录下有 Dockerfile
+    - docker build -t ${IMAGE}:${IMAGE_TAG} .
+    # 给镜像打 latest 标签
+    - docker tag ${IMAGE}:${IMAGE_TAG} ${IMAGE}:latest
+    # 推送镜像到镜像仓库
+    - docker push ${IMAGE}:${IMAGE_TAG}
+    - docker push ${IMAGE}:latest
+
+# 为开发环境定义 deploy 任务
+deploy dev:
+  # 指定这个任务属于 deploy 阶段
+  stage: deploy
+  # 指定部署任务使用的镜像
+  image: hub.example.com/library/k8s:1.28.14
+  # 在 script 之前执行的命令
+  before_script:
+    # 组合项目分支名 CI_COMMIT_REF_SLUG 和项目提交短ID CI_COMMIT_SHORT_SHA 变量
+    # 并赋值给 IMAGE_TAG 变量作为容器的标签，比如：master_44042448
+    - export IMAGE_TAG=${CI_COMMIT_REF_SLUG}_${CI_COMMIT_SHORT_SHA}
+    # 切换 k8s 上下文（上下文名称为：<path/to/agent/project>:<agent-name>），下面执行 helm update 时就会部署到这 k8s 集群
+    - kubectl config use-context ops/gitlab-agent:k8s-ali-beijing-sandbox-01
+  script:
+    # 跳转到 chart 目录（这个目录存放了 chart 文件）
+    - cd chart
+    # 设置 helm relaese 名称
+    - export RELEASE_NAME="${CI_PROJECT_NAME}"
+    # 设置部署用的值配置文件
+    - export HELM_VALUES_FILE=envs/dev/values.yaml
+    # 将固定的镜像标签 stable 替换为 IMAGE_TAG 变量的值
+    - sed -i 's/'tag:\ stable'/'tag:\ "${IMAGE_TAG}"'/' ${HELM_VALUES_FILE}
+    # 部署项目
+    - helm upgrade ${RELEASE_NAME} -f ${HELM_VALUES_FILE} . --namespace=bookinfo-fat --install --create-namespace
+  environment:
+    name: dev
+    url: https://${CI_PROJECT_NAME}-dev.example.com
+  # 设置任务执行的规则
+  rules:
+    # 仅 develop 分支触发此任务
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+# 为测试环境定义 deploy 任务
+deploy test:
+  # 指定这个任务属于 deploy 阶段
+  stage: deploy
+  # 指定部署任务使用的镜像
+  image: hub.example.com/library/k8s:1.28.14
+  # 在 script 之前执行的命令
+  before_script:
+    # 组合项目分支名 CI_COMMIT_REF_SLUG 和项目提交短ID CI_COMMIT_SHORT_SHA 变量
+    # 并赋值给 IMAGE_TAG 变量作为容器的标签，比如：master_44042448
+    - export IMAGE_TAG=${CI_COMMIT_REF_SLUG}_${CI_COMMIT_SHORT_SHA}
+    # 切换 k8s 上下文（上下文名称为：<path/to/agent/project>:<agent-name>），下面执行 helm update 时就会部署到这 k8s 集群
+    - kubectl config use-context ops/gitlab-agent:k8s-ali-beijing-sandbox-01
+  script:
+    # 跳转到 chart 目录（这个目录存放了 chart 文件）
+    - cd chart
+    # 设置 helm relaese 名称
+    - export RELEASE_NAME="${CI_PROJECT_NAME}"
+    # 设置部署用的值配置文件
+    - export HELM_VALUES_FILE=envs/test/values.yaml
+    # 将固定的镜像标签 stable 替换为 IMAGE_TAG 变量的值
+    - sed -i 's/'tag:\ stable'/'tag:\ "${IMAGE_TAG}"'/' ${HELM_VALUES_FILE}
+    # 部署项目
+    - helm upgrade ${RELEASE_NAME} -f ${HELM_VALUES_FILE} . --namespace=bookinfo-test --install --create-namespace
+  environment:
+    name: test
+    url: https://${CI_PROJECT_NAME}-test.example.com
+  # 设置任务执行的规则
+  rules:
+    # 仅 develop 分支触发此任务
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+# 为正式环境定义 deploy 任务
+deploy prod:
+  stage: deploy
+  image: hub.example.com/library/k8s:1.28.14
+  before_script:
+    - export CONTAINER_IMAGE_TAG=${CI_COMMIT_REF_SLUG}_${CI_COMMIT_SHORT_SHA}
+    - kubectl config use-context ops/gitlab-agent:k8s-ali-beijing-sandbox-01
+  script:
+    - cd chart
+    - export RELEASE_NAME="${CI_PROJECT_NAME}"
+    - export HELM_VALUES_FILE=envs/prod/values.yaml
+    - sed -i 's/'tag:\ stable'/'tag:\ "${IMAGE_TAG}"'/' ${HELM_VALUES_FILE}
+    - helm upgrade ${RELEASE_NAME} -f ${HELM_VALUES_FILE} . --namespace=bookinfo-prod --install --create-namespace
+  environment:
+    name: prod
+    url: https://${CI_PROJECT_NAME}.example.com
+  rules:
+    # 仅 master 分支触发此任务
+    - if: '$CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"'
+      # 需要手动进行部署
+      when: manual
+
